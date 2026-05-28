@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from shared.event_bus import InMemoryEventBus, RabbitMQEventBus
 from shared.event_bus import build_event_bus
+from shared.events import EventEnvelope
 from shared.events import EventType, new_event
 from shared.logging import configure_logging, log_event
 from shared.settings import get_settings
@@ -33,10 +36,213 @@ class CheckoutRequest(CartRequest):
     pickup_window: str = Field(examples=["12:00-12:15"])
 
 
+def _database_enabled() -> bool:
+    return bool(settings.database_url)
+
+
+async def _save_cart(cart: dict[str, object]) -> None:
+    if not _database_enabled():
+        return
+    await asyncio.to_thread(_save_cart_sync, cart)
+
+
+def _save_cart_sync(cart: dict[str, object]) -> None:
+    import psycopg
+
+    with psycopg.connect(settings.database_url) as conn:
+        with conn.transaction():
+            conn.execute(
+                """
+                INSERT INTO carts (cart_id, customer_name, status)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (cart_id) DO UPDATE
+                    SET customer_name = EXCLUDED.customer_name,
+                        status = EXCLUDED.status
+                """,
+                (cart["cart_id"], cart["customer_name"], cart["status"]),
+            )
+            conn.execute("DELETE FROM cart_items WHERE cart_id = %s", (cart["cart_id"],))
+            conn.executemany(
+                """
+                INSERT INTO cart_items (cart_id, sku, quantity)
+                VALUES (%s, %s, %s)
+                """,
+                [
+                    (cart["cart_id"], item["sku"], item["quantity"])
+                    for item in cart["items"]  # type: ignore[index]
+                ],
+            )
+
+
+async def _save_order(order: dict[str, object]) -> None:
+    if not _database_enabled():
+        return
+    await asyncio.to_thread(_save_order_sync, order)
+
+
+def _save_order_sync(order: dict[str, object]) -> None:
+    import psycopg
+
+    with psycopg.connect(settings.database_url) as conn:
+        with conn.transaction():
+            conn.execute(
+                """
+                INSERT INTO orders (
+                    order_id, customer_name, pickup_window,
+                    payment_status, order_status, paid_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (order_id) DO UPDATE
+                    SET customer_name = EXCLUDED.customer_name,
+                        pickup_window = EXCLUDED.pickup_window,
+                        payment_status = EXCLUDED.payment_status,
+                        order_status = EXCLUDED.order_status,
+                        paid_at = EXCLUDED.paid_at
+                """,
+                (
+                    order["order_id"],
+                    order["customer_name"],
+                    order["pickup_window"],
+                    order["payment_status"],
+                    order["order_status"],
+                    order["paid_at"],
+                ),
+            )
+            conn.execute("DELETE FROM order_items WHERE order_id = %s", (order["order_id"],))
+            conn.executemany(
+                """
+                INSERT INTO order_items (order_id, sku, quantity)
+                VALUES (%s, %s, %s)
+                """,
+                [
+                    (order["order_id"], item["sku"], item["quantity"])
+                    for item in order["items"]  # type: ignore[index]
+                ],
+            )
+
+
+async def _list_orders_from_db() -> list[dict[str, object]]:
+    if not _database_enabled():
+        return list(orders.values())
+    return await asyncio.to_thread(_list_orders_from_db_sync)
+
+
+def _list_orders_from_db_sync() -> list[dict[str, object]]:
+    import psycopg
+    from psycopg.rows import dict_row
+
+    with psycopg.connect(settings.database_url, row_factory=dict_row) as conn:
+        rows = conn.execute(
+            """
+            SELECT order_id, customer_name, pickup_window,
+                   payment_status, order_status, paid_at
+            FROM orders
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+        return [_hydrate_order_sync(conn, row) for row in rows]
+
+
+async def _get_order_from_db(order_id: str) -> dict[str, object] | None:
+    if not _database_enabled():
+        return orders.get(order_id)
+    return await asyncio.to_thread(_get_order_from_db_sync, order_id)
+
+
+def _get_order_from_db_sync(order_id: str) -> dict[str, object] | None:
+    import psycopg
+    from psycopg.rows import dict_row
+
+    with psycopg.connect(settings.database_url, row_factory=dict_row) as conn:
+        row = conn.execute(
+            """
+            SELECT order_id, customer_name, pickup_window,
+                   payment_status, order_status, paid_at
+            FROM orders
+            WHERE order_id = %s
+            """,
+            (order_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _hydrate_order_sync(conn, row)
+
+
+def _hydrate_order_sync(conn, row: dict[str, object]) -> dict[str, object]:
+    items = conn.execute(
+        """
+        SELECT sku, quantity
+        FROM order_items
+        WHERE order_id = %s
+        ORDER BY sku
+        """,
+        (row["order_id"],),
+    ).fetchall()
+    return {**dict(row), "items": [dict(item) for item in items]}
+
+
+async def update_order_status(
+    order_id: str,
+    status: str,
+    state: dict[str, dict[str, object]] = orders,
+) -> None:
+    if order_id in state:
+        state[order_id]["order_status"] = status
+    if _database_enabled():
+        await asyncio.to_thread(_update_order_status_sync, order_id, status)
+
+
+def _update_order_status_sync(order_id: str, status: str) -> None:
+    import psycopg
+
+    with psycopg.connect(settings.database_url) as conn:
+        conn.execute(
+            """
+            UPDATE orders
+            SET order_status = %s
+            WHERE order_id = %s
+            """,
+            (status, order_id),
+        )
+
+
+async def handle_order_lifecycle_event(
+    event: EventEnvelope,
+    state: dict[str, dict[str, object]] = orders,
+) -> None:
+    status_by_event = {
+        EventType.PICKUP_SLOT_RESERVED: "SlotAssigned",
+        EventType.PICKUP_SLOT_FULL: "SlotAssignmentFailed",
+        EventType.ORDER_PREPARING: "Preparing",
+        EventType.ORDER_PLACED_IN_SLOT: "PlacedInSlot",
+        EventType.ORDER_READY: "ReadyForPickup",
+        EventType.ORDER_PICKED_UP: "Completed",
+        EventType.ORDER_EXPIRED: "Expired",
+    }
+    event_type = EventType(event.event_type)
+    status = status_by_event.get(event_type)
+    if status:
+        await update_order_status(event.aggregate_id, status, state)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     event_bus = build_event_bus(settings)
     await event_bus.connect()
+    for event_type in (
+        EventType.PICKUP_SLOT_RESERVED,
+        EventType.PICKUP_SLOT_FULL,
+        EventType.ORDER_PREPARING,
+        EventType.ORDER_PLACED_IN_SLOT,
+        EventType.ORDER_READY,
+        EventType.ORDER_PICKED_UP,
+        EventType.ORDER_EXPIRED,
+    ):
+        await event_bus.subscribe(
+            event_type,
+            handle_order_lifecycle_event,
+            queue_name=f"{settings.service_name}.{event_type}",
+        )
     app.state.event_bus = event_bus
     log_event(logger, settings.service_name, "event bus connected", bus=settings.event_bus)
     try:
@@ -72,6 +278,7 @@ async def create_cart(payload: CartRequest, request: Request) -> dict[str, objec
         "status": "CartCreated",
     }
     carts[cart_id] = cart
+    await _save_cart(cart)
     event = new_event(
         EventType.CART_CREATED,
         aggregate_id=cart_id,
@@ -96,6 +303,7 @@ async def checkout(payload: CheckoutRequest, request: Request) -> dict[str, obje
         "paid_at": paid_at,
     }
     orders[order_id] = order
+    await _save_order(order)
     event = new_event(
         EventType.ORDER_PAID,
         aggregate_id=order_id,
@@ -109,10 +317,12 @@ async def checkout(payload: CheckoutRequest, request: Request) -> dict[str, obje
 
 @app.get("/orders")
 async def list_orders() -> list[dict[str, object]]:
-    return list(orders.values())
+    return await _list_orders_from_db()
 
 
 @app.get("/orders/{order_id}")
 async def get_order(order_id: str) -> dict[str, object]:
-    return orders[order_id]
-
+    order = await _get_order_from_db(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return order
