@@ -213,6 +213,7 @@ async def handle_order_lifecycle_event(
     status_by_event = {
         EventType.PICKUP_SLOT_RESERVED: "SlotAssigned",
         EventType.PICKUP_SLOT_FULL: "SlotAssignmentFailed",
+        EventType.INVENTORY_SHORTAGE_DETECTED: "InventoryShortage",
         EventType.ORDER_PREPARING: "Preparing",
         EventType.ORDER_PLACED_IN_SLOT: "PlacedInSlot",
         EventType.ORDER_READY: "ReadyForPickup",
@@ -232,6 +233,7 @@ async def lifespan(app: FastAPI):
     for event_type in (
         EventType.PICKUP_SLOT_RESERVED,
         EventType.PICKUP_SLOT_FULL,
+        EventType.INVENTORY_SHORTAGE_DETECTED,
         EventType.ORDER_PREPARING,
         EventType.ORDER_PLACED_IN_SLOT,
         EventType.ORDER_READY,
