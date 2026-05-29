@@ -28,12 +28,12 @@ class OrderItem(BaseModel):
 
 
 class CartRequest(BaseModel):
-    customer_name: str
-    items: list[OrderItem]
+    customer_name: str = Field(min_length=1)
+    items: list[OrderItem] = Field(min_length=1)
 
 
 class CheckoutRequest(CartRequest):
-    pickup_window: str = Field(examples=["12:00-12:15"])
+    pickup_window: str = Field(min_length=1, examples=["12:00-12:15"])
 
 
 def _database_enabled() -> bool:
