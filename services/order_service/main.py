@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from shared.event_bus import InMemoryEventBus, RabbitMQEventBus
 from shared.event_bus import build_event_bus
@@ -20,6 +20,7 @@ settings = get_settings("order-service")
 logger = configure_logging(settings.service_name)
 carts: dict[str, dict[str, object]] = {}
 orders: dict[str, dict[str, object]] = {}
+ALLOWED_PICKUP_WINDOWS = {"09:30-09:35", "12:00-12:15", "17:30-17:45"}
 
 
 class OrderItem(BaseModel):
@@ -34,6 +35,13 @@ class CartRequest(BaseModel):
 
 class CheckoutRequest(CartRequest):
     pickup_window: str = Field(min_length=1, examples=["12:00-12:15"])
+
+    @field_validator("pickup_window")
+    @classmethod
+    def pickup_window_must_be_supported(cls, value: str) -> str:
+        if value not in ALLOWED_PICKUP_WINDOWS:
+            raise ValueError("pickup_window must match one of the supported demo windows")
+        return value
 
 
 def _database_enabled() -> bool:
