@@ -21,6 +21,23 @@ logger = configure_logging(settings.service_name)
 carts: dict[str, dict[str, object]] = {}
 orders: dict[str, dict[str, object]] = {}
 ALLOWED_PICKUP_WINDOWS = {"09:30-09:35", "12:00-12:15", "17:30-17:45"}
+ORDER_STATUS_RANK = {
+    "Paid": 0,
+    "SlotAssigned": 1,
+    "Preparing": 2,
+    "PlacedInSlot": 3,
+    "ReadyForPickup": 4,
+    "Completed": 5,
+    "Expired": 5,
+    "InventoryShortage": 5,
+    "SlotAssignmentFailed": 5,
+}
+TERMINAL_ORDER_STATUSES = {
+    "Completed",
+    "Expired",
+    "InventoryShortage",
+    "SlotAssignmentFailed",
+}
 
 
 class OrderItem(BaseModel):
@@ -195,23 +212,50 @@ async def update_order_status(
     state: dict[str, dict[str, object]] = orders,
 ) -> None:
     if order_id in state:
+        current_status = str(state[order_id].get("order_status", ""))
+        if not _can_transition_order_status(current_status, status):
+            return
         state[order_id]["order_status"] = status
     if _database_enabled():
         await asyncio.to_thread(_update_order_status_sync, order_id, status)
+
+
+def _can_transition_order_status(current_status: str, next_status: str) -> bool:
+    if current_status == next_status:
+        return True
+    if current_status in TERMINAL_ORDER_STATUSES:
+        return False
+    current_rank = ORDER_STATUS_RANK.get(current_status)
+    next_rank = ORDER_STATUS_RANK.get(next_status)
+    if current_rank is None or next_rank is None:
+        return True
+    return next_rank >= current_rank
 
 
 def _update_order_status_sync(order_id: str, status: str) -> None:
     import psycopg
 
     with psycopg.connect(settings.database_url) as conn:
-        conn.execute(
-            """
-            UPDATE orders
-            SET order_status = %s
-            WHERE order_id = %s
-            """,
-            (status, order_id),
-        )
+        with conn.transaction():
+            row = conn.execute(
+                """
+                SELECT order_status
+                FROM orders
+                WHERE order_id = %s
+                FOR UPDATE
+                """,
+                (order_id,),
+            ).fetchone()
+            if row is None or not _can_transition_order_status(str(row[0]), status):
+                return
+            conn.execute(
+                """
+                UPDATE orders
+                SET order_status = %s
+                WHERE order_id = %s
+                """,
+                (status, order_id),
+            )
 
 
 async def handle_order_lifecycle_event(
