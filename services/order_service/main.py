@@ -87,16 +87,17 @@ def _save_cart_sync(cart: dict[str, object]) -> None:
                 (cart["cart_id"], cart["customer_name"], cart["status"]),
             )
             conn.execute("DELETE FROM cart_items WHERE cart_id = %s", (cart["cart_id"],))
-            conn.executemany(
-                """
-                INSERT INTO cart_items (cart_id, sku, quantity)
-                VALUES (%s, %s, %s)
-                """,
-                [
-                    (cart["cart_id"], item["sku"], item["quantity"])
-                    for item in cart["items"]  # type: ignore[index]
-                ],
-            )
+            with conn.cursor() as cursor:
+                cursor.executemany(
+                    """
+                    INSERT INTO cart_items (cart_id, sku, quantity)
+                    VALUES (%s, %s, %s)
+                    """,
+                    [
+                        (cart["cart_id"], item["sku"], item["quantity"])
+                        for item in cart["items"]  # type: ignore[index]
+                    ],
+                )
 
 
 async def _save_order(order: dict[str, object]) -> None:
@@ -134,16 +135,17 @@ def _save_order_sync(order: dict[str, object]) -> None:
                 ),
             )
             conn.execute("DELETE FROM order_items WHERE order_id = %s", (order["order_id"],))
-            conn.executemany(
-                """
-                INSERT INTO order_items (order_id, sku, quantity)
-                VALUES (%s, %s, %s)
-                """,
-                [
-                    (order["order_id"], item["sku"], item["quantity"])
-                    for item in order["items"]  # type: ignore[index]
-                ],
-            )
+            with conn.cursor() as cursor:
+                cursor.executemany(
+                    """
+                    INSERT INTO order_items (order_id, sku, quantity)
+                    VALUES (%s, %s, %s)
+                    """,
+                    [
+                        (order["order_id"], item["sku"], item["quantity"])
+                        for item in order["items"]  # type: ignore[index]
+                    ],
+                )
 
 
 async def _list_orders_from_db() -> list[dict[str, object]]:
