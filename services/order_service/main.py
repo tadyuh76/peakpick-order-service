@@ -12,8 +12,9 @@ from shared.event_bus import InMemoryEventBus, RabbitMQEventBus
 from shared.event_bus import build_event_bus
 from shared.events import EventEnvelope
 from shared.events import EventType, new_event
-from shared.logging import configure_logging, log_event
+from shared.logging import configure_logging, install_api_logging, log_event
 from shared.settings import get_settings
+from shared.tenancy import DEFAULT_STORE_ID, store_id_from_request
 
 
 settings = get_settings("order-service")
@@ -47,6 +48,7 @@ class OrderItem(BaseModel):
 
 class CartRequest(BaseModel):
     customer_name: str = Field(min_length=1)
+    store_id: str = Field(default=DEFAULT_STORE_ID, min_length=1)
     items: list[OrderItem] = Field(min_length=1)
 
 
@@ -78,13 +80,14 @@ def _save_cart_sync(cart: dict[str, object]) -> None:
         with conn.transaction():
             conn.execute(
                 """
-                INSERT INTO carts (cart_id, customer_name, status)
-                VALUES (%s, %s, %s)
+                INSERT INTO carts (cart_id, store_id, customer_name, status)
+                VALUES (%s, %s, %s, %s)
                 ON CONFLICT (cart_id) DO UPDATE
-                    SET customer_name = EXCLUDED.customer_name,
+                    SET store_id = EXCLUDED.store_id,
+                        customer_name = EXCLUDED.customer_name,
                         status = EXCLUDED.status
                 """,
-                (cart["cart_id"], cart["customer_name"], cart["status"]),
+                (cart["cart_id"], cart["store_id"], cart["customer_name"], cart["status"]),
             )
             conn.execute("DELETE FROM cart_items WHERE cart_id = %s", (cart["cart_id"],))
             with conn.cursor() as cursor:
@@ -114,12 +117,13 @@ def _save_order_sync(order: dict[str, object]) -> None:
             conn.execute(
                 """
                 INSERT INTO orders (
-                    order_id, customer_name, pickup_window,
+                    order_id, store_id, customer_name, pickup_window,
                     payment_status, order_status, paid_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (order_id) DO UPDATE
-                    SET customer_name = EXCLUDED.customer_name,
+                    SET store_id = EXCLUDED.store_id,
+                        customer_name = EXCLUDED.customer_name,
                         pickup_window = EXCLUDED.pickup_window,
                         payment_status = EXCLUDED.payment_status,
                         order_status = EXCLUDED.order_status,
@@ -127,6 +131,7 @@ def _save_order_sync(order: dict[str, object]) -> None:
                 """,
                 (
                     order["order_id"],
+                    order["store_id"],
                     order["customer_name"],
                     order["pickup_window"],
                     order["payment_status"],
@@ -148,48 +153,75 @@ def _save_order_sync(order: dict[str, object]) -> None:
                 )
 
 
-async def _list_orders_from_db() -> list[dict[str, object]]:
+async def _list_orders_from_db(store_id: str | None = None) -> list[dict[str, object]]:
     if not _database_enabled():
-        return list(orders.values())
-    return await asyncio.to_thread(_list_orders_from_db_sync)
+        items = list(orders.values())
+        return [item for item in items if item.get("store_id") == store_id] if store_id else items
+    return await asyncio.to_thread(_list_orders_from_db_sync, store_id)
 
 
-def _list_orders_from_db_sync() -> list[dict[str, object]]:
+def _list_orders_from_db_sync(store_id: str | None = None) -> list[dict[str, object]]:
     import psycopg
     from psycopg.rows import dict_row
 
     with psycopg.connect(settings.database_url, row_factory=dict_row) as conn:
-        rows = conn.execute(
-            """
-            SELECT order_id, customer_name, pickup_window,
-                   payment_status, order_status, paid_at
-            FROM orders
-            ORDER BY created_at DESC
-            """
-        ).fetchall()
+        if store_id:
+            rows = conn.execute(
+                """
+                SELECT order_id, store_id, customer_name, pickup_window,
+                       payment_status, order_status, paid_at
+                FROM orders
+                WHERE store_id = %s
+                ORDER BY created_at DESC
+                """,
+                (store_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT order_id, store_id, customer_name, pickup_window,
+                       payment_status, order_status, paid_at
+                FROM orders
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
         return [_hydrate_order_sync(conn, row) for row in rows]
 
 
-async def _get_order_from_db(order_id: str) -> dict[str, object] | None:
+async def _get_order_from_db(order_id: str, store_id: str | None = None) -> dict[str, object] | None:
     if not _database_enabled():
-        return orders.get(order_id)
-    return await asyncio.to_thread(_get_order_from_db_sync, order_id)
+        order = orders.get(order_id)
+        if order and store_id and order.get("store_id") != store_id:
+            return None
+        return order
+    return await asyncio.to_thread(_get_order_from_db_sync, order_id, store_id)
 
 
-def _get_order_from_db_sync(order_id: str) -> dict[str, object] | None:
+def _get_order_from_db_sync(order_id: str, store_id: str | None = None) -> dict[str, object] | None:
     import psycopg
     from psycopg.rows import dict_row
 
     with psycopg.connect(settings.database_url, row_factory=dict_row) as conn:
-        row = conn.execute(
-            """
-            SELECT order_id, customer_name, pickup_window,
-                   payment_status, order_status, paid_at
-            FROM orders
-            WHERE order_id = %s
-            """,
-            (order_id,),
-        ).fetchone()
+        if store_id:
+            row = conn.execute(
+                """
+                SELECT order_id, store_id, customer_name, pickup_window,
+                       payment_status, order_status, paid_at
+                FROM orders
+                WHERE order_id = %s AND store_id = %s
+                """,
+                (order_id, store_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT order_id, store_id, customer_name, pickup_window,
+                       payment_status, order_status, paid_at
+                FROM orders
+                WHERE order_id = %s
+                """,
+                (order_id,),
+            ).fetchone()
         if row is None:
             return None
         return _hydrate_order_sync(conn, row)
@@ -313,6 +345,7 @@ app = FastAPI(
     description="Cart, mock checkout, and order lifecycle events.",
     lifespan=lifespan,
 )
+install_api_logging(app, logger, settings.service_name)
 
 
 @app.get("/health")
@@ -327,8 +360,10 @@ async def health(request: Request) -> dict[str, object]:
 @app.post("/carts", status_code=201)
 async def create_cart(payload: CartRequest, request: Request) -> dict[str, object]:
     cart_id = f"cart-{uuid4()}"
+    store_id = store_id_from_request(request, payload.store_id)
     cart = {
         "cart_id": cart_id,
+        "store_id": store_id,
         "customer_name": payload.customer_name,
         "items": [item.model_dump() for item in payload.items],
         "status": "CartCreated",
@@ -348,9 +383,11 @@ async def create_cart(payload: CartRequest, request: Request) -> dict[str, objec
 @app.post("/checkout", status_code=201)
 async def checkout(payload: CheckoutRequest, request: Request) -> dict[str, object]:
     order_id = f"order-{uuid4()}"
+    store_id = store_id_from_request(request, payload.store_id)
     paid_at = datetime.now(UTC).isoformat()
     order = {
         "order_id": order_id,
+        "store_id": store_id,
         "customer_name": payload.customer_name,
         "items": [item.model_dump() for item in payload.items],
         "pickup_window": payload.pickup_window,
@@ -372,13 +409,13 @@ async def checkout(payload: CheckoutRequest, request: Request) -> dict[str, obje
 
 
 @app.get("/orders")
-async def list_orders() -> list[dict[str, object]]:
-    return await _list_orders_from_db()
+async def list_orders(request: Request) -> list[dict[str, object]]:
+    return await _list_orders_from_db(request.headers.get("x-store-id"))
 
 
 @app.get("/orders/{order_id}")
-async def get_order(order_id: str) -> dict[str, object]:
-    order = await _get_order_from_db(order_id)
+async def get_order(order_id: str, request: Request) -> dict[str, object]:
+    order = await _get_order_from_db(order_id, request.headers.get("x-store-id"))
     if order is None:
         raise HTTPException(status_code=404, detail="Order not found")
     return order
