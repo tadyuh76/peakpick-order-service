@@ -1,16 +1,29 @@
 # PeakPick Order Service
 
-Owns cart, checkout, mock payment, and order lifecycle state. It publishes `CartCreated` and `OrderPaid`, then reacts to lifecycle events from other services.
+Order Service là microservice quản lý giỏ hàng, checkout mock và trạng thái đơn hàng.
 
-Owned database tables:
+## Database Riêng
+
+Service này sở hữu database `peakpick_order` với các bảng:
 
 - `carts`
 - `cart_items`
 - `orders`
 - `order_items`
-- local `event_log`
+- `event_log`
 
-Run locally:
+## Event
+
+Phát event:
+
+- `CartCreated`
+- `OrderPaid`
+
+Nhận event:
+
+- Các event vòng đời đơn hàng từ Slot và Store Operations để cập nhật trạng thái đọc.
+
+## Chạy Local
 
 ```bash
 pip install -r requirements.txt
